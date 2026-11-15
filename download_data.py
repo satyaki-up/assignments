@@ -2,10 +2,10 @@ import argparse
 import hashlib
 import json
 import os
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+from hf_transfer import download as hf_transfer_download
 
 from data import (
     DEFAULT_DATA_REPO_ID,
@@ -16,6 +16,11 @@ from data import (
 
 
 CHUNK_BYTES = 8 * 1024 * 1024
+HF_TRANSFER_CHUNK_BYTES = 10 * 1024 * 1024
+HF_TRANSFER_MAX_FILES = 100
+HF_TRANSFER_MAX_RETRIES = 5
+HF_TRANSFER_PARALLEL_FAILURES = 3
+PROGRESS_EVERY_BYTES = 512 * 1024 * 1024
 
 
 def hf_file_url(repo_id, revision, filename):
@@ -54,6 +59,13 @@ def _existing_file_is_valid(path, expected_size=None, expected_sha256=None):
     return True
 
 
+def _hf_headers():
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _download_file(url, path, *, expected_size=None, expected_sha256=None, force=False):
     path = Path(path)
     if not force and _existing_file_is_valid(path, expected_size, expected_sha256):
@@ -66,31 +78,47 @@ def _download_file(url, path, *, expected_size=None, expected_sha256=None, force
         tmp_path.unlink()
 
     print(f"Downloading {url} -> {path}")
-    digest = hashlib.sha256()
-    bytes_written = 0
-    try:
-        with urllib.request.urlopen(url) as response, tmp_path.open("wb") as f:
-            while True:
-                chunk = response.read(CHUNK_BYTES)
-                if not chunk:
-                    break
-                f.write(chunk)
-                digest.update(chunk)
-                bytes_written += len(chunk)
-                if expected_size and bytes_written % (512 * 1024 * 1024) < CHUNK_BYTES:
-                    print(
-                        f"  {_format_bytes(bytes_written)} / "
-                        f"{_format_bytes(expected_size)}"
-                    )
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Failed to download {url}: HTTP {exc.code}") from exc
+    bytes_reported = 0
+    next_report = PROGRESS_EVERY_BYTES
 
-    if expected_size is not None and bytes_written != expected_size:
-        raise RuntimeError(
-            f"Downloaded {bytes_written} bytes for {path}, expected {expected_size}."
+    def _on_chunk(num_bytes):
+        nonlocal bytes_reported, next_report
+        bytes_reported += int(num_bytes)
+        if expected_size and bytes_reported >= next_report:
+            print(
+                f"  {_format_bytes(bytes_reported)} / "
+                f"{_format_bytes(expected_size)}"
+            )
+            next_report += PROGRESS_EVERY_BYTES
+
+    try:
+        hf_transfer_download(
+            url=url,
+            filename=str(tmp_path),
+            max_files=HF_TRANSFER_MAX_FILES,
+            chunk_size=HF_TRANSFER_CHUNK_BYTES,
+            parallel_failures=HF_TRANSFER_PARALLEL_FAILURES,
+            max_retries=HF_TRANSFER_MAX_RETRIES,
+            headers=_hf_headers(),
+            callback=_on_chunk,
         )
-    actual_sha256 = digest.hexdigest()
+    except Exception as exc:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise RuntimeError(f"Failed to download {url}: {exc}") from exc
+
+    if not tmp_path.exists():
+        raise RuntimeError(f"Failed to download {url}: no file was written.")
+
+    actual_size = tmp_path.stat().st_size
+    if expected_size is not None and actual_size != expected_size:
+        tmp_path.unlink()
+        raise RuntimeError(
+            f"Downloaded {actual_size} bytes for {path}, expected {expected_size}."
+        )
+    actual_sha256 = _file_sha256(tmp_path)
     if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        tmp_path.unlink()
         raise RuntimeError(
             f"sha256 mismatch for {path}: got {actual_sha256}, "
             f"expected {expected_sha256}."
