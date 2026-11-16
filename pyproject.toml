@@ -5,6 +5,7 @@ description = "CS312 Deep Learning Alchemy pretraining playground."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "hf-transfer",
     "huggingface-hub",
     "matplotlib",
     "modal>=1.5.3",
